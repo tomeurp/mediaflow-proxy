@@ -646,12 +646,13 @@ def build_hls_playlist(
 
     # In TS mode, we don't use EXT-X-MAP because TS segments are self-contained
     # (PAT/PMT/VPS/SPS/PPS are embedded in each segment).
-    # Use EXT-X-MAP for:
-    #   - live fMP4 streams (init changes with discontinuities)
-    #   - SegmentBase fMP4 (init and media are different byte ranges of the same file;
-    #     without EXT-X-MAP every segment would redundantly include the moov box)
-    has_segment_base = not is_ts_mode and any(p.get("initRange") for p in profiles)
-    use_map = not is_ts_mode and (is_live or has_segment_base)
+    #
+    # In fMP4 mode, always use EXT-X-MAP. The init segment belongs in the HLS
+    # map and each media segment should contain only the media fragment. When
+    # VOD SegmentTemplate playlists do not use EXT-X-MAP, every segment is
+    # generated as init.mp4 + media.m4s, causing repeated moov atoms and player
+    # warnings such as "Found duplicated MOOV Atom. Skipped it".
+    use_map = not is_ts_mode
 
     # Select appropriate endpoint based on remux mode
     if is_ts_mode:
