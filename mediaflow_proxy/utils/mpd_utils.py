@@ -295,10 +295,29 @@ def parse_representation(
     Returns:
         Optional[dict]: The parsed profile information or None if not applicable.
     """
-    mime_type = _get_key(adaptation, representation, "@mimeType") or (
-        "video/mp4" if "avc" in representation["@codecs"] else "audio/mp4"
+    codecs = representation.get("@codecs") or adaptation.get("@codecs") or ""
+    content_type = representation.get("@contentType") or adaptation.get("@contentType") or ""
+    mime_type = _get_key(adaptation, representation, "@mimeType")
+
+    if not mime_type:
+        if "avc" in codecs or content_type == "video":
+            mime_type = "video/mp4"
+        elif "mp4a" in codecs or content_type == "audio":
+            mime_type = "audio/mp4"
+        elif "vtt" in codecs or content_type in ("text", "subtitle", "subtitles"):
+            mime_type = "text/vtt"
+        elif "stpp" in codecs or "ttml" in codecs:
+            mime_type = "application/ttml+xml"
+        else:
+            return None
+
+    is_text_profile = (
+        "text" in mime_type
+        or "vtt" in mime_type
+        or "ttml" in mime_type
+        or content_type in ("text", "subtitle", "subtitles")
     )
-    if "video" not in mime_type and "audio" not in mime_type:
+    if "video" not in mime_type and "audio" not in mime_type and not is_text_profile:
         return None
 
     # Raw rep.id from XML — used for $RepresentationID$ URL template expansion.
@@ -315,7 +334,7 @@ def parse_representation(
         "rep_id": rep_id,  # raw XML @id for $RepresentationID$ template expansion
         "mimeType": mime_type,
         "lang": representation.get("@lang") or adaptation.get("@lang"),
-        "codecs": representation.get("@codecs") or adaptation.get("@codecs"),
+        "codecs": codecs or ("wvtt" if "vtt" in mime_type else "stpp.ttml.im1t" if "ttml" in mime_type else ""),
         "bandwidth": bandwidth_for_id,
         "startWithSAP": (_get_key(adaptation, representation, "@startWithSAP") or "1") == "1",
         "mediaPresentationDuration": media_presentation_duration,
@@ -324,6 +343,9 @@ def parse_representation(
     if "audio" in profile["mimeType"]:
         profile["audioSamplingRate"] = representation.get("@audioSamplingRate") or adaptation.get("@audioSamplingRate")
         profile["channels"] = representation.get("AudioChannelConfiguration", {}).get("@value", "2")
+    elif is_text_profile:
+        profile["textUrl"] = resolve_base_url(adaptation_base_url, get_base_url(representation))
+        profile["label"] = representation.get("@label") or adaptation.get("@label")
     else:
         # Handle video-specific attributes, making them optional with sensible defaults
         if "@width" in representation:
@@ -388,6 +410,28 @@ def parse_representation(
                 profile["initRange"] = init_data["@range"]
 
     if parse_segment_profile_id is None or profile["id"] != parse_segment_profile_id:
+        return profile
+
+    if is_text_profile:
+        base_url = resolve_base_url(adaptation_base_url, get_base_url(representation))
+        profile["textUrl"] = base_url
+        if parse_segment_profile_id is None or profile["id"] != parse_segment_profile_id:
+            return profile
+
+        total_duration = media_presentation_duration
+        if isinstance(total_duration, str):
+            total_duration = parse_duration(total_duration)
+        elif total_duration is None:
+            total_duration = 0
+
+        profile["segments"] = [
+            {
+                "type": "subtitle",
+                "media": base_url,
+                "number": 1,
+                "extinf": total_duration if total_duration and total_duration > 0 else 1.0,
+            }
+        ]
         return profile
 
     # Parse segments based on the addressing scheme used
