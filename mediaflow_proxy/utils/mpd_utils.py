@@ -42,47 +42,42 @@ def resolve_url(base_url: str, relative_url: str) -> str:
 
 
 
-def _base_url_text(element: Optional[dict]) -> str:
-    """
-    Extract the text value from a DASH BaseURL element.
 
-    xmltodict may represent BaseURL either as a string, as a dict with
-    '#text' plus attributes, or as a list when multiple BaseURL entries are
-    present. MediaFlow currently uses the first BaseURL entry in document order.
-    """
-    if not element:
+def _baseurl_text(node) -> str:
+    """Return the first textual BaseURL value from an xmltodict node."""
+    if not node:
         return ""
-    if isinstance(element, list):
-        return _base_url_text(element[0]) if element else ""
-    if isinstance(element, dict):
-        return str(element.get("#text", "") or "").strip()
-    return str(element).strip()
+    if isinstance(node, str):
+        return node.strip()
+    if isinstance(node, list):
+        for item in node:
+            value = _baseurl_text(item)
+            if value:
+                return value
+        return ""
+    if isinstance(node, dict):
+        value = node.get("#text") or node.get("@href") or node.get("@url")
+        return str(value).strip() if value else ""
+    return str(node).strip()
 
 
-def get_base_url(element: Optional[dict]) -> str:
-    """Return the BaseURL text for an MPD, Period, AdaptationSet or Representation."""
+def get_base_url(element: dict) -> str:
+    """Extract BaseURL text from an MPD/Period/AdaptationSet/Representation element."""
     if not isinstance(element, dict):
         return ""
-    return _base_url_text(element.get("BaseURL"))
+    return _baseurl_text(element.get("BaseURL"))
 
 
-def resolve_base_url(mpd_url: str, *elements: Optional[dict]) -> str:
-    """
-    Resolve BaseURL inheritance according to DASH hierarchy.
+def resolve_base_url(parent_base_url: str, child_base_url: str) -> str:
+    """Resolve a child BaseURL against its parent BaseURL/MPD URL."""
+    if not child_base_url:
+        return parent_base_url
+    return resolve_url(parent_base_url, child_base_url)
 
-    BaseURL may be present at MPD, Period, AdaptationSet and/or Representation
-    level. Each child BaseURL is resolved relative to the already resolved
-    parent base. Absolute BaseURL values correctly replace the previous origin.
 
-    If no BaseURL is present, the manifest URL is returned so relative segment
-    templates still resolve relative to the MPD URL as before.
-    """
-    base = mpd_url
-    for element in elements:
-        base_url = get_base_url(element)
-        if base_url:
-            base = resolve_url(base, base_url)
-    return base
+def resolve_template_url(base_url: str, template_url: str) -> str:
+    """Resolve an initialization/media template URL against the effective BaseURL."""
+    return resolve_url(base_url, template_url)
 
 
 def parse_mpd(mpd_content: Union[str, bytes]) -> dict:
@@ -119,32 +114,35 @@ def parse_mpd_dict(
     profiles = []
     parsed_dict = {}
 
-    mpd_root = mpd_dict["MPD"]
-    is_live = mpd_root.get("@type", "static").lower() == "dynamic"
+    is_live = mpd_dict["MPD"].get("@type", "static").lower() == "dynamic"
     parsed_dict["isLive"] = is_live
 
-    media_presentation_duration = mpd_root.get("@mediaPresentationDuration")
+    media_presentation_duration = mpd_dict["MPD"].get("@mediaPresentationDuration")
 
     # Parse additional MPD attributes for live streams
     if is_live:
-        parsed_dict["minimumUpdatePeriod"] = parse_duration(mpd_root.get("@minimumUpdatePeriod", "PT0S"))
-        parsed_dict["timeShiftBufferDepth"] = parse_duration(mpd_root.get("@timeShiftBufferDepth", "PT2M"))
+        parsed_dict["minimumUpdatePeriod"] = parse_duration(mpd_dict["MPD"].get("@minimumUpdatePeriod", "PT0S"))
+        parsed_dict["timeShiftBufferDepth"] = parse_duration(mpd_dict["MPD"].get("@timeShiftBufferDepth", "PT2M"))
         parsed_dict["availabilityStartTime"] = datetime.fromisoformat(
-            mpd_root["@availabilityStartTime"].replace("Z", "+00:00")
+            mpd_dict["MPD"]["@availabilityStartTime"].replace("Z", "+00:00")
         )
         parsed_dict["publishTime"] = datetime.fromisoformat(
-            mpd_root.get("@publishTime", "").replace("Z", "+00:00")
+            mpd_dict["MPD"].get("@publishTime", "").replace("Z", "+00:00")
         )
 
-    periods = mpd_root["Period"]
+    mpd_base_url = resolve_base_url(mpd_url, get_base_url(mpd_dict.get("MPD", {})))
+
+    periods = mpd_dict["MPD"]["Period"]
     periods = periods if isinstance(periods, list) else [periods]
 
     for period in periods:
+        period_base_url = resolve_base_url(mpd_base_url, get_base_url(period))
         parsed_dict["PeriodStart"] = parse_duration(period.get("@start", "PT0S"))
         adaptation_sets = period["AdaptationSet"]
         adaptation_sets = adaptation_sets if isinstance(adaptation_sets, list) else [adaptation_sets]
 
         for adaptation in adaptation_sets:
+            adaptation_base_url = resolve_base_url(period_base_url, get_base_url(adaptation))
             representations = adaptation["Representation"]
             representations = representations if isinstance(representations, list) else [representations]
 
@@ -153,9 +151,8 @@ def parse_mpd_dict(
                     parsed_dict,
                     representation,
                     adaptation,
-                    mpd_root,
-                    period,
                     mpd_url,
+                    adaptation_base_url,
                     media_presentation_duration,
                     parse_segment_profile_id,
                 )
@@ -170,6 +167,7 @@ def parse_mpd_dict(
     parsed_dict["drmInfo"] = drm_info
 
     return parsed_dict
+
 
 def pad_base64(encoded_key_id):
     """
@@ -234,31 +232,23 @@ def process_content_protection(content_protection: Union[list[dict], dict], drm_
 
     This function updates the drm_info dictionary with DRM system information found in the ContentProtection elements.
     """
-    if not content_protection:
-        return drm_info
     if not isinstance(content_protection, list):
         content_protection = [content_protection]
 
     for protection in content_protection:
-        if not isinstance(protection, dict):
-            continue
-
         drm_info["isDrmProtected"] = True
         scheme_id_uri = protection.get("@schemeIdUri", "").lower()
 
         if "clearkey" in scheme_id_uri:
             drm_info["drmSystem"] = "clearkey"
-            laurl = protection.get("clearkey:Laurl")
-            if isinstance(laurl, dict):
-                la_url = laurl.get("#text")
-            else:
-                la_url = laurl
-            if la_url and "laUrl" not in drm_info:
-                drm_info["laUrl"] = la_url
+            if "clearkey:Laurl" in protection:
+                la_url = protection["clearkey:Laurl"].get("#text")
+                if la_url and "laUrl" not in drm_info:
+                    drm_info["laUrl"] = la_url
 
         elif "widevine" in scheme_id_uri or "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed" in scheme_id_uri:
             drm_info["drmSystem"] = "widevine"
-            pssh_node = protection.get("cenc:pssh")
+            pssh_node = protection.get("cenc:pssh", {})
             if isinstance(pssh_node, dict):
                 pssh = pssh_node.get("#text")
             else:
@@ -274,33 +264,39 @@ def process_content_protection(content_protection: Union[list[dict], dict], drm_
             if "keyId" not in drm_info:
                 drm_info["keyId"] = key_id
 
-        laurl = protection.get("ms:laurl")
-        if isinstance(laurl, dict):
-            la_url = laurl.get("@licenseUrl")
+        if "ms:laurl" in protection:
+            la_url = protection["ms:laurl"].get("@licenseUrl")
             if la_url and "laUrl" not in drm_info:
                 drm_info["laUrl"] = la_url
 
     return drm_info
 
+
 def parse_representation(
     parsed_dict: dict,
     representation: dict,
     adaptation: dict,
-    mpd_root: dict,
-    period: dict,
     mpd_url: str,
+    adaptation_base_url: str,
     media_presentation_duration: str,
     parse_segment_profile_id: Optional[str],
 ) -> Optional[dict]:
     """
     Parses a representation and extracts profile information.
 
-    BaseURL is inherited using the DASH hierarchy MPD -> Period ->
-    AdaptationSet -> Representation. The resulting base is absolute and is used
-    for SegmentTemplate, SegmentList and SegmentBase URL resolution.
+    Args:
+        parsed_dict (dict): The parsed MPD data.
+        representation (dict): The representation data.
+        adaptation (dict): The adaptation set data.
+        mpd_url (str): The URL of the MPD manifest.
+        media_presentation_duration (str): The media presentation duration.
+        parse_segment_profile_id (str, optional): The profile ID to parse segments for. Defaults to None.
+
+    Returns:
+        Optional[dict]: The parsed profile information or None if not applicable.
     """
     mime_type = _get_key(adaptation, representation, "@mimeType") or (
-        "video/mp4" if "avc" in representation.get("@codecs", "") else "audio/mp4"
+        "video/mp4" if "avc" in representation["@codecs"] else "audio/mp4"
     )
     if "video" not in mime_type and "audio" not in mime_type:
         return None
@@ -325,11 +321,6 @@ def parse_representation(
         "mediaPresentationDuration": media_presentation_duration,
     }
 
-    # Effective absolute BaseURL after DASH inheritance. For the Makusi MPD this
-    # picks the Period-level CDN BaseURL instead of the MPD manifest directory.
-    base_url = resolve_base_url(mpd_url, mpd_root, period, adaptation, representation)
-    profile["baseUrl"] = base_url
-
     if "audio" in profile["mimeType"]:
         profile["audioSamplingRate"] = representation.get("@audioSamplingRate") or adaptation.get("@audioSamplingRate")
         profile["channels"] = representation.get("AudioChannelConfiguration", {}).get("@value", "2")
@@ -349,13 +340,12 @@ def parse_representation(
         else:
             profile["height"] = 0  # Default if height is missing
 
-        frame_rate = representation.get("@frameRate") or adaptation.get("@maxFrameRate") or adaptation.get("@frameRate") or "30000/1001"
+        frame_rate = representation.get("@frameRate") or adaptation.get("@maxFrameRate") or "30000/1001"
         frame_rate = frame_rate if "/" in frame_rate else f"{frame_rate}/1"
         profile["frameRate"] = round(int(frame_rate.split("/")[0]) / int(frame_rate.split("/")[1]), 3)
         profile["sar"] = representation.get("@sar", "1:1")
 
-    # Extract segment template start number for adaptive sequence calculation.
-    # Representation-level SegmentTemplate overrides AdaptationSet-level SegmentTemplate.
+    # Extract segment template start number for adaptive sequence calculation
     segment_template_data = representation.get("SegmentTemplate") or adaptation.get("SegmentTemplate")
     if segment_template_data:
         profile["segment_template_start_number_explicit"] = "@startNumber" in segment_template_data
@@ -375,7 +365,8 @@ def parse_representation(
     # This is needed for the HLS playlist builder to reference the init URL
     segment_base_data = representation.get("SegmentBase")
     if segment_base_data and "initUrl" not in profile:
-        profile["initUrl"] = base_url
+        representation_base_url = resolve_base_url(adaptation_base_url, get_base_url(representation))
+        profile["initUrl"] = representation_base_url
 
         # Store initialization range if available
         if "Initialization" in segment_base_data:
@@ -386,22 +377,26 @@ def parse_representation(
     # For SegmentList profiles, we also need to set initUrl even when not parsing segments
     segment_list_data = representation.get("SegmentList") or adaptation.get("SegmentList")
     if segment_list_data and "initUrl" not in profile:
+        representation_base_url = resolve_base_url(adaptation_base_url, get_base_url(representation))
         if "Initialization" in segment_list_data:
             init_data = segment_list_data["Initialization"]
             if "@sourceURL" in init_data:
                 init_url = init_data["@sourceURL"]
-                profile["initUrl"] = resolve_url(base_url, init_url)
+                profile["initUrl"] = resolve_template_url(representation_base_url, init_url)
             elif "@range" in init_data:
-                profile["initUrl"] = base_url
+                profile["initUrl"] = representation_base_url
                 profile["initRange"] = init_data["@range"]
 
     if parse_segment_profile_id is None or profile["id"] != parse_segment_profile_id:
         return profile
 
-    # Parse segments based on the addressing scheme used.
-    # Representation-level segment addressing overrides AdaptationSet-level addressing.
+    # Parse segments based on the addressing scheme used
     segment_template = representation.get("SegmentTemplate") or adaptation.get("SegmentTemplate")
     segment_list = representation.get("SegmentList") or adaptation.get("SegmentList")
+
+    # Effective BaseURL inherited through MPD -> Period -> AdaptationSet -> Representation.
+    # Absolute child BaseURLs replace the parent origin/path, relative child BaseURLs extend it.
+    base_url = resolve_base_url(adaptation_base_url, get_base_url(representation))
 
     if segment_template:
         profile["segments"] = parse_segment_template(parsed_dict, segment_template, profile, mpd_url, base_url)
@@ -413,6 +408,7 @@ def parse_representation(
         profile["segments"] = parse_segment_base(representation, profile, mpd_url, base_url)
 
     return profile
+
 
 def _get_key(adaptation: dict, representation: dict, key: str) -> Optional[str]:
     """
@@ -440,7 +436,7 @@ def parse_segment_template(
         item (dict): The segment template data.
         profile (dict): The profile information.
         mpd_url (str): The URL of the MPD manifest.
-        base_url (str): The inherited absolute DASH BaseURL for this representation.
+        base_url (str): The BaseURL from the representation (optional, for per-representation paths).
 
     Returns:
         List[Dict]: The list of parsed segments.
@@ -456,26 +452,25 @@ def parse_segment_template(
     except (ValueError, TypeError):
         profile["segment_template_start_number"] = 1
 
-    effective_base_url = base_url or mpd_url
-
     # Initialization
     if "@initialization" in item:
         media = item["@initialization"]
         media = media.replace("$RepresentationID$", profile.get("rep_id", profile["id"]))
         media = media.replace("$Bandwidth$", str(profile["bandwidth"]))
-        profile["initUrl"] = resolve_url(effective_base_url, media)
+        profile["initUrl"] = resolve_template_url(base_url or mpd_url, media)
 
     # Segments
     if "SegmentTimeline" in item:
-        segments.extend(parse_segment_timeline(parsed_dict, item, profile, mpd_url, timescale, effective_base_url))
+        segments.extend(parse_segment_timeline(parsed_dict, item, profile, mpd_url, timescale, base_url))
     elif "@duration" in item:
         try:
             profile["nominal_duration_mpd_timescale"] = int(item["@duration"])
         except (ValueError, TypeError):
             pass
-        segments.extend(parse_segment_duration(parsed_dict, item, profile, mpd_url, timescale, effective_base_url))
+        segments.extend(parse_segment_duration(parsed_dict, item, profile, mpd_url, timescale, base_url))
 
     return segments
+
 
 def parse_segment_timeline(
     parsed_dict: dict, item: dict, profile: dict, mpd_url: str, timescale: int, base_url: str = ""
@@ -697,7 +692,7 @@ def create_segment_data(
         profile (dict): The profile information.
         mpd_url (str): The URL of the MPD manifest.
         timescale (int, optional): The timescale for the segments. Defaults to None.
-        base_url (str): The inherited absolute DASH BaseURL for this representation.
+        base_url (str): The BaseURL from the representation (optional, for per-representation paths).
 
     Returns:
         Dict: The created segment data.
@@ -738,10 +733,7 @@ def create_segment_data(
     if "$Time$" in media:
         logger.warning("Unresolved $Time$ placeholder in segment URL template: %s", media_template)
 
-    # Resolve the segment template against the inherited DASH BaseURL. Do not
-    # concatenate strings: urljoin semantics are required for absolute BaseURL,
-    # absolute paths and nested relative BaseURL values.
-    media = resolve_url(base_url or mpd_url, media)
+    media = resolve_template_url(base_url or mpd_url, media)
 
     segment_data = {
         "type": "segment",
@@ -789,6 +781,7 @@ def create_segment_data(
 
     return segment_data
 
+
 def parse_segment_list(
     adaptation: dict, representation: dict, profile: dict, mpd_url: str, timescale: int, base_url: str = ""
 ) -> List[Dict]:
@@ -797,21 +790,31 @@ def parse_segment_list(
 
     SegmentList MPDs explicitly list each segment URL, unlike SegmentTemplate which uses
     URL patterns. This is less common but used by some packagers.
+
+    Args:
+        adaptation (dict): The adaptation set data.
+        representation (dict): The representation data.
+        profile (dict): The profile information.
+        mpd_url (str): The URL of the MPD manifest.
+        timescale (int): The timescale for duration calculations.
+
+    Returns:
+        List[Dict]: The list of parsed segments.
     """
-    # SegmentList can be at AdaptationSet or Representation level. Representation overrides AdaptationSet.
+    # SegmentList can be at AdaptationSet or Representation level
     segment_list = representation.get("SegmentList") or adaptation.get("SegmentList", {})
     segments = []
-    effective_base_url = base_url or mpd_url
 
     # Handle Initialization element
     if "Initialization" in segment_list:
         init_data = segment_list["Initialization"]
         if "@sourceURL" in init_data:
             init_url = init_data["@sourceURL"]
-            profile["initUrl"] = resolve_url(effective_base_url, init_url)
+            profile["initUrl"] = resolve_url(mpd_url, init_url)
         elif "@range" in init_data:
             # Initialization by byte range on the BaseURL
-            profile["initUrl"] = effective_base_url
+            base_url = representation.get("BaseURL", "")
+            profile["initUrl"] = resolve_url(mpd_url, base_url)
             profile["initRange"] = init_data["@range"]
 
     # Get segment duration from SegmentList attributes
@@ -833,10 +836,10 @@ def parse_segment_list(
         media_range = seg_url.get("@mediaRange")
 
         if media_url:
-            media_url = resolve_url(effective_base_url, media_url)
+            media_url = resolve_template_url(base_url or mpd_url, media_url)
         else:
-            # Use BaseURL with byte range
-            media_url = effective_base_url
+            # Use effective BaseURL with byte range
+            media_url = base_url or mpd_url
 
         segment_data = {
             "type": "segment",
@@ -853,6 +856,7 @@ def parse_segment_list(
 
     return segments
 
+
 def parse_segment_base(representation: dict, profile: dict, mpd_url: str, base_url: str = "") -> List[Dict]:
     """
     Parses segment base information and extracts segment data. This is used for single-segment representations
@@ -860,10 +864,18 @@ def parse_segment_base(representation: dict, profile: dict, mpd_url: str, base_u
 
     For SegmentBase, the entire media file is treated as a single segment. The initialization data
     is specified by the Initialization element's range, and the segment index (SIDX) is at indexRange.
+
+    Args:
+        representation (dict): The representation data.
+        profile (dict): The profile information.
+        mpd_url (str): The URL of the MPD manifest.
+
+    Returns:
+        List[Dict]: The list of parsed segments.
     """
     segment = representation.get("SegmentBase", {})
 
-    # Build the full media URL from inherited BaseURL
+    # Build the full media URL from the effective inherited BaseURL
     media_url = base_url or mpd_url
 
     # Set initUrl for SegmentBase - this is the URL with the initialization range
@@ -900,20 +912,20 @@ def parse_segment_base(representation: dict, profile: dict, mpd_url: str, base_u
         except (ValueError, IndexError):
             pass
 
-    # Create a single segment representing the media portion
-    segment_data = {
-        "type": "segment",
-        "media": media_url,
-        "number": 1,
-        "extinf": total_duration,
-    }
+    # For SegmentBase, we return a single segment representing the entire media
+    # The media URL is the same as initUrl but will be accessed with different byte ranges
+    return [
+        {
+            "type": "segment",
+            "media": media_url,
+            "number": 1,
+            "extinf": total_duration if total_duration > 0 else 1.0,
+            "indexRange": index_range,
+            "initRange": init_range,
+            "mediaRange": media_range,
+        }
+    ]
 
-    if media_range:
-        segment_data["mediaRange"] = media_range
-    if index_range:
-        segment_data["indexRange"] = index_range
-
-    return [segment_data]
 
 def parse_sidx_fragments(sidx_bytes: bytes, index_range_start: int) -> List[Dict]:
     """
